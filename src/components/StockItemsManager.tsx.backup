@@ -1,0 +1,1632 @@
+import { useState, useEffect, useMemo } from 'react';
+import {
+  Plus, Search, Filter, Edit2, Trash2, Package, Barcode, Image as ImageIcon,
+  FileText, Tag, MapPin, Box, DollarSign, TrendingUp, Check, X, Upload, Download,
+  Grid, List, Printer, QrCode, Hash, Columns, ChevronDown, ChevronUp, Group
+} from 'lucide-react';
+import { supabase } from '../lib/supabase';
+import { useAuth } from '../contexts/AuthContext';
+import { generateBarcode, generateQRCode, generateAssetCode } from '../lib/barcodeHelpers';
+import SerializedItemsManager from './SerializedItemsManager';
+import StockItemGallery from './StockItemGallery';
+
+interface StockItem {
+  id: string;
+  item_code: string;
+  name: string;
+  description?: string;
+  store_id?: string;
+  bin_id?: string;
+  category_id?: string;
+  unit_of_measure?: string;
+  item_type: string;
+  is_serialized?: boolean;
+  is_kit: boolean;
+  manufacturer?: string;
+  model?: string;
+  year?: number;
+  dimensions?: string;
+  weight?: number;
+  color?: string;
+  capacity?: string;
+  barcode?: string;
+  qr_code?: string;
+  purchase_cost?: number;
+  replacement_cost?: number;
+  reorder_point?: number;
+  reorder_quantity?: number;
+  is_active: boolean;
+  custom_fields?: any;
+  stores?: { code: string; name: string };
+  bins?: { code: string; name: string };
+  categories?: { name: string };
+  total_quantity?: number;
+  available_quantity?: number;
+  serialized_count?: number;
+}
+
+interface Store {
+  id: string;
+  code: string;
+  name: string;
+}
+
+interface Bin {
+  id: string;
+  store_id: string;
+  code: string;
+  name: string;
+}
+
+interface Category {
+  id: string;
+  name: string;
+  parent_id?: string;
+  path?: string;
+}
+
+interface UnitOfMeasure {
+  id: string;
+  code: string;
+  name: string;
+  unit_type: string;
+  is_active: boolean;
+}
+
+interface StockItemImage {
+  id: string;
+  item_id: string;
+  file_path: string;
+  is_primary: boolean;
+}
+
+type ColumnKey = 'item_code' | 'photo' | 'description' | 'quantity' | 'unit' | 'cost' | 'location' | 'category' | 'manufacturer' | 'type' | 'year' | 'color' | 'capacity' | 'barcode' | 'status';
+
+interface Column {
+  key: ColumnKey;
+  label: string;
+  visible: boolean;
+}
+
+export default function StockItemsManager() {
+  const { user } = useAuth();
+  const [items, setItems] = useState<StockItem[]>([]);
+  const [stores, setStores] = useState<Store[]>([]);
+  const [bins, setBins] = useState<Bin[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [unitsOfMeasure, setUnitsOfMeasure] = useState<UnitOfMeasure[]>([]);
+  const [itemImages, setItemImages] = useState<Record<string, StockItemImage | null>>({});
+  const [loading, setLoading] = useState(true);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [selectedStore, setSelectedStore] = useState<string>('');
+  const [selectedBin, setSelectedBin] = useState<string>('');
+  const [viewMode, setViewMode] = useState<'grid' | 'list'>('list');
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [editingItem, setEditingItem] = useState<StockItem | null>(null);
+  const [showSerializedManager, setShowSerializedManager] = useState<{ itemId: string; itemName: string } | null>(null);
+  const [showGallery, setShowGallery] = useState<{ itemId: string; itemName: string } | null>(null);
+  const [showColumnSelector, setShowColumnSelector] = useState(false);
+  const [showFilterPanel, setShowFilterPanel] = useState(false);
+  const [selectedCategories, setSelectedCategories] = useState<string[]>([]);
+  const [selectedManufacturers, setSelectedManufacturers] = useState<string[]>([]);
+  const [selectedItemTypes, setSelectedItemTypes] = useState<string[]>([]);
+  const [selectedStatuses, setSelectedStatuses] = useState<string[]>([]);
+  const [groupBy, setGroupBy] = useState<string[]>([]);
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const [columns, setColumns] = useState<Column[]>([
+    { key: 'item_code', label: 'Item Code', visible: true },
+    { key: 'description', label: 'Description', visible: true },
+    { key: 'photo', label: 'Photo', visible: true },
+    { key: 'quantity', label: 'Quantity', visible: true },
+    { key: 'unit', label: 'Unit', visible: true },
+    { key: 'cost', label: 'Cost', visible: true },
+    { key: 'location', label: 'Location', visible: false },
+    { key: 'category', label: 'Category', visible: false },
+    { key: 'manufacturer', label: 'Manufacturer', visible: false },
+    { key: 'type', label: 'Type', visible: false },
+    { key: 'year', label: 'Year', visible: false },
+    { key: 'color', label: 'Color', visible: false },
+    { key: 'capacity', label: 'Capacity', visible: false },
+    { key: 'barcode', label: 'Barcode', visible: false },
+    { key: 'status', label: 'Status', visible: false }
+  ]);
+
+  useEffect(() => {
+    if (user) {
+      fetchData();
+    }
+  }, [user, selectedStore, selectedBin]);
+
+  const getCategoryPath = (categoryId: string, allCategories: Category[]): string => {
+    const category = allCategories.find(c => c.id === categoryId);
+    if (!category) return '';
+
+    if (category.parent_id) {
+      const parentPath = getCategoryPath(category.parent_id, allCategories);
+      return parentPath ? `${parentPath} → ${category.name}` : category.name;
+    }
+
+    return category.name;
+  };
+
+  const fetchData = async () => {
+    await fetchUnitsOfMeasure();
+    try {
+      setLoading(true);
+
+      let itemsQuery = supabase
+        .from('stock_items')
+        .select(`
+          *,
+          stores:stock_stores(code, name),
+          bins:stock_bins(code, name),
+          categories:stock_categories(name)
+        `)
+        .order('item_code');
+
+      if (selectedStore) {
+        itemsQuery = itemsQuery.eq('store_id', selectedStore);
+      }
+      if (selectedBin) {
+        itemsQuery = itemsQuery.eq('bin_id', selectedBin);
+      }
+
+      const [itemsResult, storesResult, binsResult, categoriesResult, serializedCountResult, quantitiesResult] = await Promise.all([
+        itemsQuery,
+        supabase.from('stock_stores').select('*').eq('is_active', true).order('code'),
+        supabase.from('stock_bins').select('*').eq('is_active', true).order('code'),
+        supabase.from('stock_categories').select('*').order('name'),
+        supabase.from('stock_serialized_items').select('id, item_id'),
+        supabase.from('stock_quantities').select('item_id, quantity_on_hand')
+      ]);
+
+      if (itemsResult.error) {
+        console.error('Items query error:', itemsResult.error);
+        throw itemsResult.error;
+      }
+      if (storesResult.error) {
+        console.error('Stores query error:', storesResult.error);
+        throw storesResult.error;
+      }
+      if (binsResult.error) {
+        console.error('Bins query error:', binsResult.error);
+        throw binsResult.error;
+      }
+      if (categoriesResult.error) {
+        console.error('Categories query error:', categoriesResult.error);
+        throw categoriesResult.error;
+      }
+
+      console.log('Fetched items:', itemsResult.data?.length || 0);
+      console.log('Fetched stores:', storesResult.data?.length || 0);
+      console.log('Fetched bins:', binsResult.data?.length || 0);
+
+      const allCategories = categoriesResult.data || [];
+      const leafCategories = allCategories
+        .filter(cat => {
+          const hasChildren = allCategories.some(c => c.parent_id === cat.id);
+          return !hasChildren;
+        })
+        .map(cat => ({
+          ...cat,
+          path: getCategoryPath(cat.id, allCategories)
+        }))
+        .sort((a, b) => (a.path || a.name).localeCompare(b.path || b.name));
+
+      const items = itemsResult.data || [];
+      const serializedItems = serializedCountResult.data || [];
+      const quantities = quantitiesResult.data || [];
+
+      const enrichedItems = items.map(item => {
+        if (item.is_serialized) {
+          const itemSerializedUnits = serializedItems.filter(si => si.item_id === item.id);
+          return {
+            ...item,
+            serialized_count: itemSerializedUnits.length,
+            total_quantity: itemSerializedUnits.length
+          };
+        } else {
+          const itemQuantities = quantities.filter(q => q.item_id === item.id);
+          const totalQty = itemQuantities.reduce((sum, q) => sum + (q.quantity_on_hand || 0), 0);
+          return {
+            ...item,
+            total_quantity: totalQty
+          };
+        }
+      });
+
+      setItems(enrichedItems);
+      setStores(storesResult.data || []);
+      setBins(binsResult.data || []);
+      setCategories(leafCategories);
+
+      const itemIds = enrichedItems.map(item => item.id);
+      await fetchItemImages(itemIds);
+    } catch (error) {
+      console.error('Error fetching stock items:', error);
+      alert('Error loading stock items. Check console for details.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchUnitsOfMeasure = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('units_of_measure')
+        .select('*')
+        .eq('is_active', true)
+        .order('display_order');
+
+      if (error) throw error;
+      setUnitsOfMeasure(data || []);
+    } catch (error) {
+      console.error('Error fetching units of measure:', error);
+    }
+  };
+
+  const fetchItemImages = async (itemIds: string[]) => {
+    if (itemIds.length === 0) return;
+
+    try {
+      const { data, error } = await supabase
+        .from('stock_item_images')
+        .select('id, item_id, file_path, is_primary')
+        .in('item_id', itemIds)
+        .eq('is_primary', true);
+
+      if (error) throw error;
+
+      const imageMap: Record<string, StockItemImage | null> = {};
+      itemIds.forEach(id => {
+        const image = data?.find(img => img.item_id === id);
+        imageMap[id] = image || null;
+      });
+
+      setItemImages(imageMap);
+    } catch (error) {
+      console.error('Error fetching item images:', error);
+    }
+  };
+
+  const filteredItems = useMemo(() => {
+    return items.filter(item => {
+      const matchesSearch =
+        item.item_code.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        item.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        item.description?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        item.manufacturer?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        item.model?.toLowerCase().includes(searchTerm.toLowerCase());
+
+      const matchesCategory = selectedCategories.length === 0 ||
+        (item.category_id && selectedCategories.includes(item.category_id));
+
+      const matchesManufacturer = selectedManufacturers.length === 0 ||
+        (item.manufacturer && selectedManufacturers.includes(item.manufacturer));
+
+      const matchesItemType = selectedItemTypes.length === 0 ||
+        selectedItemTypes.includes(item.item_type);
+
+      const matchesStatus = selectedStatuses.length === 0 ||
+        (selectedStatuses.includes('active') && item.is_active) ||
+        (selectedStatuses.includes('inactive') && !item.is_active);
+
+      return matchesSearch && matchesCategory && matchesManufacturer && matchesItemType && matchesStatus;
+    });
+  }, [items, searchTerm, selectedCategories, selectedManufacturers, selectedItemTypes, selectedStatuses]);
+
+  const uniqueManufacturers = useMemo(() => {
+    const manufacturers = items
+      .map(item => item.manufacturer)
+      .filter((m): m is string => !!m)
+      .filter((m, i, arr) => arr.indexOf(m) === i)
+      .sort();
+    return manufacturers;
+  }, [items]);
+
+  const uniqueItemTypes = useMemo(() => {
+    const types = items
+      .map(item => item.item_type)
+      .filter((t, i, arr) => arr.indexOf(t) === i)
+      .sort();
+    return types;
+  }, [items]);
+
+  const groupedItems = useMemo(() => {
+    if (groupBy.length === 0) return null;
+
+    const groups: Record<string, StockItem[]> = {};
+
+    filteredItems.forEach(item => {
+      const groupKey = groupBy.map(field => {
+        switch (field) {
+          case 'category':
+            return item.categories?.name || 'Uncategorized';
+          case 'manufacturer':
+            return item.manufacturer || 'Unknown';
+          case 'type':
+            return item.item_type || 'Unknown';
+          case 'location':
+            return item.stores?.name || 'No Location';
+          case 'status':
+            return item.is_active ? 'Active' : 'Inactive';
+          default:
+            return 'Other';
+        }
+      }).join(' > ');
+
+      if (!groups[groupKey]) {
+        groups[groupKey] = [];
+      }
+      groups[groupKey].push(item);
+    });
+
+    return Object.entries(groups).sort(([a], [b]) => a.localeCompare(b));
+  }, [filteredItems, groupBy]);
+
+  const filteredBins = selectedStore
+    ? bins.filter(bin => bin.store_id === selectedStore)
+    : bins;
+
+  const formatCurrency = (amount?: number) => {
+    if (!amount) return '-';
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD',
+      minimumFractionDigits: 2,
+    }).format(amount);
+  };
+
+  const handleDelete = async (id: string) => {
+    if (!confirm('Are you sure you want to delete this item?')) return;
+
+    try {
+      const { error } = await supabase
+        .from('stock_items')
+        .delete()
+        .eq('id', id);
+
+      if (error) throw error;
+
+      fetchData();
+    } catch (error) {
+      console.error('Error deleting item:', error);
+      alert('Failed to delete item');
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const formData = new FormData(e.currentTarget);
+
+    const storeId = formData.get('store_id') as string;
+    const binId = formData.get('bin_id') as string;
+    const categoryId = formData.get('category_id') as string;
+    const itemType = formData.get('item_type') as string;
+
+    const itemData = {
+      item_code: formData.get('item_code') as string,
+      name: formData.get('name') as string,
+      description: formData.get('description') as string || null,
+      store_id: storeId && storeId !== '' ? storeId : null,
+      bin_id: binId && binId !== '' ? binId : null,
+      category_id: categoryId && categoryId !== '' ? categoryId : null,
+      unit_of_measure: formData.get('unit_of_measure') as string || null,
+      item_type: itemType,
+      is_serialized: itemType === 'serialized',
+      is_kit: false,
+      manufacturer: formData.get('manufacturer') as string || null,
+      model: formData.get('model') as string || null,
+      year: formData.get('year') ? parseInt(formData.get('year') as string) : null,
+      dimensions: formData.get('dimensions') as string || null,
+      weight: formData.get('weight') ? parseFloat(formData.get('weight') as string) : null,
+      color: formData.get('color') as string || null,
+      capacity: formData.get('capacity') ? parseFloat(formData.get('capacity') as string) : null,
+      purchase_cost: formData.get('purchase_cost') ? parseFloat(formData.get('purchase_cost') as string) : null,
+      replacement_cost: formData.get('replacement_cost') ? parseFloat(formData.get('replacement_cost') as string) : null,
+      is_active: formData.get('is_active') === 'on',
+    };
+
+    try {
+      if (editingItem) {
+        const { error } = await supabase
+          .from('stock_items')
+          .update(itemData)
+          .eq('id', editingItem.id);
+
+        if (error) throw error;
+        alert('Item updated successfully!');
+      } else {
+        const barcode = await generateBarcode(itemData.item_code);
+        const qrCode = await generateQRCode(itemData.item_code);
+
+        const { error } = await supabase
+          .from('stock_items')
+          .insert({
+            ...itemData,
+            barcode,
+            qr_code: qrCode,
+          });
+
+        if (error) throw error;
+        alert('Item added successfully!');
+      }
+
+      setShowAddModal(false);
+      setEditingItem(null);
+      fetchData();
+    } catch (error: any) {
+      console.error('Error saving item:', error);
+      alert(`Failed to save item: ${error.message || 'Check console for details'}`);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-96">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+          <p className="mt-4 text-gray-600">Loading stock items...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold text-gray-900">Stock Items</h2>
+          <p className="text-gray-600 mt-1">Manage your inventory catalog</p>
+        </div>
+        <button
+          onClick={() => setShowAddModal(true)}
+          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+        >
+          <Plus size={20} />
+          Add Item
+        </button>
+      </div>
+
+      {/* Filters and Controls */}
+      <div className="bg-white rounded-lg border border-gray-200 p-4 space-y-4">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" size={20} />
+            <input
+              type="text"
+              placeholder="Search items..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            />
+          </div>
+
+          <select
+            value={selectedStore}
+            onChange={(e) => {
+              setSelectedStore(e.target.value);
+              setSelectedBin('');
+            }}
+            className="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+          >
+            <option value="">All Stores</option>
+            {stores.map((store) => (
+              <option key={store.id} value={store.id}>
+                {store.code} - {store.name}
+              </option>
+            ))}
+          </select>
+
+          <select
+            value={selectedBin}
+            onChange={(e) => setSelectedBin(e.target.value)}
+            className="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            disabled={!selectedStore}
+          >
+            <option value="">All Bins</option>
+            {filteredBins.map((bin) => (
+              <option key={bin.id} value={bin.id}>
+                {bin.code} - {bin.name}
+              </option>
+            ))}
+          </select>
+
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <button
+                onClick={() => setShowColumnSelector(!showColumnSelector)}
+                className="flex items-center gap-2 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
+                title="Column Visibility"
+              >
+                <Columns size={20} />
+                Columns
+              </button>
+              {showColumnSelector && (
+                <div className="absolute right-0 mt-2 w-56 bg-white rounded-lg border border-gray-200 shadow-lg z-10 p-3 space-y-2">
+                  <div className="font-semibold text-sm text-gray-700 mb-2">Show Columns</div>
+                  {columns.map(col => (
+                    <label key={col.key} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-50 p-1 rounded">
+                      <input
+                        type="checkbox"
+                        checked={col.visible}
+                        onChange={(e) => {
+                          setColumns(columns.map(c =>
+                            c.key === col.key ? { ...c, visible: e.target.checked } : c
+                          ));
+                        }}
+                        className="rounded text-blue-600 focus:ring-blue-500"
+                      />
+                      <span>{col.label}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <button
+              onClick={() => setShowFilterPanel(!showFilterPanel)}
+              className="flex items-center gap-2 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
+              title="Filters"
+            >
+              <Filter size={20} />
+              Filters
+              {(selectedCategories.length > 0 || selectedManufacturers.length > 0 || selectedItemTypes.length > 0 || selectedStatuses.length > 0) && (
+                <span className="bg-blue-600 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
+                  {selectedCategories.length + selectedManufacturers.length + selectedItemTypes.length + selectedStatuses.length}
+                </span>
+              )}
+            </button>
+
+            <div className="relative">
+              <button
+                onClick={() => {
+                  const panel = document.getElementById('groupByPanel');
+                  if (panel) panel.classList.toggle('hidden');
+                }}
+                className="flex items-center gap-2 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
+                title="Group By"
+              >
+                <Group size={20} />
+                Group
+                {groupBy.length > 0 && (
+                  <span className="bg-green-600 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
+                    {groupBy.length}
+                  </span>
+                )}
+              </button>
+              <div id="groupByPanel" className="hidden absolute right-0 mt-2 w-56 bg-white rounded-lg border border-gray-200 shadow-lg z-10 p-3 space-y-2">
+                <div className="font-semibold text-sm text-gray-700 mb-2">Group By</div>
+                {['category', 'manufacturer', 'type', 'location', 'status'].map(field => (
+                  <label key={field} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-50 p-1 rounded">
+                    <input
+                      type="checkbox"
+                      checked={groupBy.includes(field)}
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setGroupBy([...groupBy, field]);
+                        } else {
+                          setGroupBy(groupBy.filter(f => f !== field));
+                        }
+                      }}
+                      className="rounded text-green-600 focus:ring-green-500"
+                    />
+                    <span className="capitalize">{field}</span>
+                  </label>
+                ))}
+                {groupBy.length > 0 && (
+                  <button
+                    onClick={() => setGroupBy([])}
+                    className="w-full text-xs text-red-600 hover:text-red-700 mt-2 pt-2 border-t"
+                  >
+                    Clear Grouping
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Filter Panel */}
+        {showFilterPanel && (
+          <div className="border-t pt-4 space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Category</label>
+                <div className="max-h-40 overflow-y-auto border border-gray-300 rounded-lg p-2 space-y-1">
+                  {categories.map(cat => (
+                    <label key={cat.id} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-50 p-1 rounded">
+                      <input
+                        type="checkbox"
+                        checked={selectedCategories.includes(cat.id)}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setSelectedCategories([...selectedCategories, cat.id]);
+                          } else {
+                            setSelectedCategories(selectedCategories.filter(id => id !== cat.id));
+                          }
+                        }}
+                        className="rounded text-blue-600"
+                      />
+                      <span className="text-xs">{cat.path || cat.name}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Manufacturer</label>
+                <div className="max-h-40 overflow-y-auto border border-gray-300 rounded-lg p-2 space-y-1">
+                  {uniqueManufacturers.map(mfr => (
+                    <label key={mfr} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-50 p-1 rounded">
+                      <input
+                        type="checkbox"
+                        checked={selectedManufacturers.includes(mfr)}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setSelectedManufacturers([...selectedManufacturers, mfr]);
+                          } else {
+                            setSelectedManufacturers(selectedManufacturers.filter(m => m !== mfr));
+                          }
+                        }}
+                        className="rounded text-blue-600"
+                      />
+                      <span className="text-xs">{mfr}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Type</label>
+                <div className="max-h-40 overflow-y-auto border border-gray-300 rounded-lg p-2 space-y-1">
+                  {uniqueItemTypes.map(type => (
+                    <label key={type} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-50 p-1 rounded">
+                      <input
+                        type="checkbox"
+                        checked={selectedItemTypes.includes(type)}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setSelectedItemTypes([...selectedItemTypes, type]);
+                          } else {
+                            setSelectedItemTypes(selectedItemTypes.filter(t => t !== type));
+                          }
+                        }}
+                        className="rounded text-blue-600"
+                      />
+                      <span className="text-xs">{type}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Status</label>
+                <div className="border border-gray-300 rounded-lg p-2 space-y-1">
+                  {['active', 'inactive'].map(status => (
+                    <label key={status} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-50 p-1 rounded">
+                      <input
+                        type="checkbox"
+                        checked={selectedStatuses.includes(status)}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setSelectedStatuses([...selectedStatuses, status]);
+                          } else {
+                            setSelectedStatuses(selectedStatuses.filter(s => s !== status));
+                          }
+                        }}
+                        className="rounded text-blue-600"
+                      />
+                      <span className="text-xs capitalize">{status}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => {
+                  setSelectedCategories([]);
+                  setSelectedManufacturers([]);
+                  setSelectedItemTypes([]);
+                  setSelectedStatuses([]);
+                }}
+                className="px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                Clear All Filters
+              </button>
+              <button
+                onClick={() => setShowFilterPanel(false)}
+                className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+              >
+                Apply Filters
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Stats */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div className="bg-white rounded-lg border border-gray-200 p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm text-gray-600">Total Items</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1">{filteredItems.length}</p>
+            </div>
+            <Package className="text-gray-400" size={24} />
+          </div>
+        </div>
+
+        <div className="bg-white rounded-lg border border-gray-200 p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm text-gray-600">Active Items</p>
+              <p className="text-2xl font-bold text-green-600 mt-1">
+                {filteredItems.filter(i => i.is_active).length}
+              </p>
+            </div>
+            <Check className="text-green-400" size={24} />
+          </div>
+        </div>
+
+        <div className="bg-white rounded-lg border border-gray-200 p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm text-gray-600">Kits</p>
+              <p className="text-2xl font-bold text-blue-600 mt-1">
+                {filteredItems.filter(i => i.is_kit).length}
+              </p>
+            </div>
+            <Box className="text-blue-400" size={24} />
+          </div>
+        </div>
+
+        <div className="bg-white rounded-lg border border-gray-200 p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm text-gray-600">Total Value</p>
+              <p className="text-2xl font-bold text-green-600 mt-1">
+                {formatCurrency(filteredItems.reduce((sum, i) => sum + (i.replacement_cost || 0), 0))}
+              </p>
+            </div>
+            <DollarSign className="text-green-400" size={24} />
+          </div>
+        </div>
+      </div>
+
+      {/* Items List/Grid */}
+      {viewMode === 'list' ? (
+        <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+          <div className="overflow-x-auto">
+            {groupedItems ? (
+              <div className="divide-y divide-gray-200">
+                {groupedItems.map(([groupKey, groupItems]) => {
+                  const isExpanded = expandedGroups.has(groupKey);
+                  return (
+                    <div key={groupKey}>
+                      <button
+                        onClick={() => {
+                          const newExpanded = new Set(expandedGroups);
+                          if (isExpanded) {
+                            newExpanded.delete(groupKey);
+                          } else {
+                            newExpanded.add(groupKey);
+                          }
+                          setExpandedGroups(newExpanded);
+                        }}
+                        className="w-full flex items-center justify-between px-6 py-3 bg-gray-100 hover:bg-gray-200 transition-colors"
+                      >
+                        <div className="flex items-center gap-2">
+                          {isExpanded ? <ChevronDown size={20} /> : <ChevronUp size={20} />}
+                          <span className="font-semibold text-gray-900">{groupKey}</span>
+                          <span className="text-sm text-gray-600">({groupItems.length} items)</span>
+                        </div>
+                      </button>
+                      {isExpanded && (
+                        <table className="w-full">
+                          <thead className="bg-gray-50 border-b border-gray-200">
+                            <tr>
+                              {columns.filter(c => c.visible).map(col => (
+                                <th key={col.key} className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                  {col.label}
+                                </th>
+                              ))}
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                Actions
+                              </th>
+                            </tr>
+                          </thead>
+                          <tbody className="bg-white divide-y divide-gray-200">
+                            {groupItems.map((item) => renderTableRow(item))}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <table className="w-full">
+                <thead className="bg-gray-50 border-b border-gray-200">
+                  <tr>
+                    {columns.filter(c => c.visible).map(col => (
+                      <th key={col.key} className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        {col.label}
+                      </th>
+                    ))}
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Actions
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {filteredItems.map((item) => renderTableRow(item))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      ) : null}
+
+      {/* Empty State */}
+      {filteredItems.length === 0 && (
+        <div className="bg-white rounded-lg border border-gray-200 p-12">
+          <div className="text-center">
+            <Package className="mx-auto text-gray-400 mb-4" size={48} />
+            <p className="text-gray-600">No items found</p>
+            <button
+              onClick={() => setShowAddModal(true)}
+              className="mt-4 text-blue-600 hover:text-blue-800 font-medium"
+            >
+              Add your first item
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Modals will appear below in existing code */}
+    </div>
+  );
+
+  function renderTableRow(item: StockItem) {
+    const visibleColumns = columns.filter(c => c.visible);
+    const primaryImage = itemImages[item.id];
+
+    return (
+      <tr key={item.id} className="hover:bg-gray-50">
+        {visibleColumns.map(col => (
+          <td key={col.key} className="px-6 py-4 whitespace-nowrap">
+            {col.key === 'item_code' && (
+              <div className="flex items-center gap-2">
+                <span className="font-medium text-gray-900">{item.item_code}</span>
+                {item.barcode && <Barcode size={16} className="text-gray-400" title="Has barcode" />}
+                {item.qr_code && <QrCode size={16} className="text-gray-400" title="Has QR code" />}
+                {item.is_kit && <Box size={16} className="text-blue-500" title="Kit" />}
+              </div>
+            )}
+            {col.key === 'description' && (
+              <div className="text-sm max-w-md">
+                <div className="font-medium text-gray-900">{item.name}</div>
+                {item.description && (
+                  <div className="text-gray-500 truncate">{item.description}</div>
+                )}
+              </div>
+            )}
+            {col.key === 'photo' && (
+              <div className="flex items-center justify-center">
+                {primaryImage ? (
+                  <img
+                    src={`${supabase.storage.from('stock-item-images').getPublicUrl(primaryImage.file_path).data.publicUrl}`}
+                    alt={item.name}
+                    className="w-12 h-12 object-cover rounded border border-gray-200 cursor-pointer hover:opacity-80"
+                    onClick={() => setShowGallery({ itemId: item.id, itemName: item.name })}
+                  />
+                ) : (
+                  <div className="w-12 h-12 bg-gray-100 rounded border border-gray-200 flex items-center justify-center">
+                    <ImageIcon size={16} className="text-gray-400" />
+                  </div>
+                )}
+              </div>
+            )}
+            {col.key === 'quantity' && (
+              <div className="text-sm text-gray-900">
+                {item.is_serialized ? (
+                  <button
+                    onClick={() => setShowSerializedManager({ itemId: item.id, itemName: item.name })}
+                    className="text-blue-600 hover:text-blue-800 font-medium"
+                  >
+                    {item.serialized_count || 0} units
+                  </button>
+                ) : (
+                  <span>{item.total_quantity || 0}</span>
+                )}
+              </div>
+            )}
+            {col.key === 'unit' && (
+              <div className="text-sm text-gray-600">
+                {item.unit_of_measure || '-'}
+              </div>
+            )}
+            {col.key === 'cost' && (
+              <div className="text-sm text-gray-900 font-medium">
+                {formatCurrency(item.replacement_cost)}
+              </div>
+            )}
+            {col.key === 'location' && (
+              <div className="text-sm text-gray-500">
+                {item.stores && <div className="font-medium">{item.stores.name}</div>}
+                {item.bins && <div className="text-xs text-gray-400">{item.bins.name}</div>}
+              </div>
+            )}
+            {col.key === 'category' && (
+              <div className="text-sm text-gray-600">
+                {item.categories?.name || '-'}
+              </div>
+            )}
+            {col.key === 'manufacturer' && (
+              <div className="text-sm text-gray-600">
+                {item.manufacturer && <div>{item.manufacturer}</div>}
+                {item.model && <div className="text-xs text-gray-400">{item.model}</div>}
+              </div>
+            )}
+            {col.key === 'type' && (
+              <div className="flex items-center gap-2 text-sm text-gray-600">
+                <span>{item.item_type}</span>
+                {item.is_serialized && <Hash size={14} className="text-blue-500" title="Serialized" />}
+              </div>
+            )}
+            {col.key === 'year' && (
+              <div className="text-sm text-gray-600">
+                {item.year || '-'}
+              </div>
+            )}
+            {col.key === 'color' && (
+              <div className="text-sm text-gray-600">
+                {item.color || '-'}
+              </div>
+            )}
+            {col.key === 'capacity' && (
+              <div className="text-sm text-gray-600">
+                {item.capacity || '-'}
+              </div>
+            )}
+            {col.key === 'barcode' && (
+              <div className="text-sm text-gray-600">
+                {item.barcode ? <Barcode size={20} className="text-gray-600" /> : '-'}
+              </div>
+            )}
+            {col.key === 'status' && (
+              <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                item.is_active ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'
+              }`}>
+                {item.is_active ? 'Active' : 'Inactive'}
+              </span>
+            )}
+          </td>
+        ))}
+        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setEditingItem(item)}
+              className="text-blue-600 hover:text-blue-800"
+              title="Edit"
+            >
+              <Edit2 size={16} />
+            </button>
+            <button
+              onClick={() => setShowGallery({ itemId: item.id, itemName: item.name })}
+              className="text-green-600 hover:text-green-800"
+              title="Photo Gallery"
+            >
+              <ImageIcon size={16} />
+            </button>
+            <button
+              onClick={() => handleDelete(item.id)}
+              className="text-red-600 hover:text-red-800"
+              title="Delete"
+            >
+              <Trash2 size={16} />
+            </button>
+            <button
+              className="text-gray-600 hover:text-gray-800"
+              title="Print Label"
+            >
+              <Printer size={16} />
+            </button>
+          </div>
+        </td>
+      </tr>
+    );
+  }
+
+      {/* Add/Edit Modal */}
+      {(showAddModal || editingItem) && (
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium text-gray-900">{item.item_code}</span>
+                        {item.barcode && (
+                          <Barcode size={16} className="text-gray-400" title="Has barcode" />
+                        )}
+                        {item.qr_code && (
+                          <QrCode size={16} className="text-gray-400" title="Has QR code" />
+                        )}
+                        {item.is_kit && (
+                          <Box size={16} className="text-blue-500" title="Kit" />
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4">
+                      <div className="text-sm">
+                        <div className="font-medium text-gray-900">{item.name}</div>
+                        {item.description && (
+                          <div className="text-gray-500 truncate max-w-xs">{item.description}</div>
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      <div>
+                        {item.stores && <div className="font-medium">{item.stores.name}</div>}
+                        {item.bins && <div className="text-xs text-gray-400">{item.bins.name}</div>}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {item.manufacturer && <div>{item.manufacturer}</div>}
+                      {item.model && <div className="text-xs text-gray-400">{item.model}</div>}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      <div className="flex items-center gap-2">
+                        <span>{item.item_type}</span>
+                        {item.is_serialized && (
+                          <Hash size={14} className="text-blue-500" title="Serialized" />
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                      {item.is_serialized ? (
+                        <button
+                          onClick={() => setShowSerializedManager({ itemId: item.id, itemName: item.name })}
+                          className="text-blue-600 hover:text-blue-800 font-medium"
+                        >
+                          {item.serialized_count || 0} units
+                        </button>
+                      ) : (
+                        <span>{item.total_quantity || 0}</span>
+                      )}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                      {formatCurrency(item.replacement_cost)}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                        item.is_active
+                          ? 'bg-green-100 text-green-800'
+                          : 'bg-gray-100 text-gray-800'
+                      }`}>
+                        {item.is_active ? 'Active' : 'Inactive'}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setEditingItem(item)}
+                          className="text-blue-600 hover:text-blue-800"
+                          title="Edit"
+                        >
+                          <Edit2 size={16} />
+                        </button>
+                        <button
+                          onClick={() => setShowGallery({ itemId: item.id, itemName: item.name })}
+                          className="text-green-600 hover:text-green-800"
+                          title="Photo Gallery"
+                        >
+                          <ImageIcon size={16} />
+                        </button>
+                        <button
+                          onClick={() => handleDelete(item.id)}
+                          className="text-red-600 hover:text-red-800"
+                          title="Delete"
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                        <button
+                          className="text-gray-600 hover:text-gray-800"
+                          title="Print Label"
+                        >
+                          <Printer size={16} />
+                        </button>
+                        {item.is_serialized && (
+                          <button
+                            onClick={() => setShowSerializedManager({ itemId: item.id, itemName: item.name })}
+                            className="text-purple-600 hover:text-purple-800"
+                            title="Manage Serial Numbers"
+                          >
+                            <Hash size={16} />
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {filteredItems.length === 0 && (
+            <div className="text-center py-12">
+              <Package className="mx-auto text-gray-400 mb-4" size={48} />
+              <p className="text-gray-600">No items found</p>
+              <button
+                onClick={() => setShowAddModal(true)}
+                className="mt-4 text-blue-600 hover:text-blue-800 font-medium"
+              >
+                Add your first item
+              </button>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+          {filteredItems.map((item) => (
+            <div key={item.id} className="bg-white rounded-lg border border-gray-200 p-4 hover:shadow-lg transition-shadow">
+              <div className="flex items-start justify-between mb-3">
+                <div className="flex-1">
+                  <div className="font-semibold text-gray-900">{item.item_code}</div>
+                  <div className="text-sm text-gray-600 mt-1">{item.name}</div>
+                </div>
+                <div className="flex gap-1">
+                  <button
+                    onClick={() => setEditingItem(item)}
+                    className="p-1 text-blue-600 hover:bg-blue-50 rounded"
+                  >
+                    <Edit2 size={14} />
+                  </button>
+                  <button
+                    onClick={() => setShowGallery({ itemId: item.id, itemName: item.name })}
+                    className="p-1 text-green-600 hover:bg-green-50 rounded"
+                    title="Photo Gallery"
+                  >
+                    <ImageIcon size={14} />
+                  </button>
+                  <button
+                    onClick={() => handleDelete(item.id)}
+                    className="p-1 text-red-600 hover:bg-red-50 rounded"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-2 text-sm">
+                {item.stores && (
+                  <div className="flex items-center gap-2 text-gray-600">
+                    <MapPin size={14} />
+                    <span>{item.stores.name}</span>
+                  </div>
+                )}
+
+                {item.manufacturer && (
+                  <div className="flex items-center gap-2 text-gray-600">
+                    <Tag size={14} />
+                    <span>{item.manufacturer} {item.model}</span>
+                  </div>
+                )}
+
+                <div className="flex items-center justify-between pt-2 border-t border-gray-200">
+                  <span className="text-gray-600">Cost:</span>
+                  <span className="font-semibold text-gray-900">
+                    {formatCurrency(item.replacement_cost)}
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-2 pt-1">
+                  {item.barcode && <Barcode size={14} className="text-gray-400" />}
+                  {item.qr_code && <QrCode size={14} className="text-gray-400" />}
+                  {item.is_kit && <Box size={14} className="text-blue-500" />}
+                  <span className={`ml-auto inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${
+                    item.is_active ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'
+                  }`}>
+                    {item.is_active ? 'Active' : 'Inactive'}
+                  </span>
+                </div>
+              </div>
+            </div>
+          ))}
+
+          {filteredItems.length === 0 && (
+            <div className="col-span-full text-center py-12">
+              <Package className="mx-auto text-gray-400 mb-4" size={48} />
+              <p className="text-gray-600">No items found</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Add/Edit Modal */}
+      {(showAddModal || editingItem) && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-lg max-w-4xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="sticky top-0 bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between">
+              <h2 className="text-xl font-semibold text-gray-900">
+                {editingItem ? 'Edit Stock Item' : 'Add New Stock Item'}
+              </h2>
+              <button
+                onClick={() => {
+                  setShowAddModal(false);
+                  setEditingItem(null);
+                }}
+                className="text-gray-400 hover:text-gray-600"
+              >
+                <X size={24} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmit} className="p-6 space-y-6">
+              {/* Basic Information */}
+              <div className="space-y-4">
+                <h3 className="text-lg font-medium text-gray-900">Basic Information</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Item Code *
+                    </label>
+                    <input
+                      type="text"
+                      name="item_code"
+                      defaultValue={editingItem?.item_code}
+                      required
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="e.g., SAFMAS002"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Item Name *
+                    </label>
+                    <input
+                      type="text"
+                      name="name"
+                      defaultValue={editingItem?.name}
+                      required
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="e.g., Safety Boots"
+                    />
+                  </div>
+
+                  <div className="md:col-span-2">
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Description
+                    </label>
+                    <textarea
+                      name="description"
+                      defaultValue={editingItem?.description}
+                      rows={3}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="Detailed description of the item..."
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Item Type *
+                    </label>
+                    <select
+                      name="item_type"
+                      defaultValue={editingItem?.item_type || 'non_serialized'}
+                      required
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    >
+                      <option value="serialized">Serialized - Track individual units by serial number</option>
+                      <option value="non_serialized">Non-Serialized - Track by bulk quantity</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Unit of Measure
+                    </label>
+                    <select
+                      name="unit_of_measure"
+                      defaultValue={editingItem?.unit_of_measure}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    >
+                      <option value="">Select Unit</option>
+                      {unitsOfMeasure.map((unit) => (
+                        <option key={unit.id} value={unit.code}>
+                          {unit.code} - {unit.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              {/* Location */}
+              <div className="space-y-4">
+                <h3 className="text-lg font-medium text-gray-900">Location</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Store
+                    </label>
+                    <select
+                      name="store_id"
+                      defaultValue={editingItem?.store_id}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    >
+                      <option value="">Select Store</option>
+                      {stores.map((store) => (
+                        <option key={store.id} value={store.id}>
+                          {store.code} - {store.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Bin
+                    </label>
+                    <select
+                      name="bin_id"
+                      defaultValue={editingItem?.bin_id}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    >
+                      <option value="">Select Bin</option>
+                      {bins.map((bin) => (
+                        <option key={bin.id} value={bin.id}>
+                          {bin.code} - {bin.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Category
+                    </label>
+                    <select
+                      name="category_id"
+                      defaultValue={editingItem?.category_id}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    >
+                      <option value="">Select Category</option>
+                      {categories.map((category) => (
+                        <option key={category.id} value={category.id}>
+                          {category.path || category.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              {/* Specifications */}
+              <div className="space-y-4">
+                <h3 className="text-lg font-medium text-gray-900">Specifications</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Manufacturer
+                    </label>
+                    <input
+                      type="text"
+                      name="manufacturer"
+                      defaultValue={editingItem?.manufacturer}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="e.g., Bova"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Model
+                    </label>
+                    <input
+                      type="text"
+                      name="model"
+                      defaultValue={editingItem?.model}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="e.g., Chelsea Black"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Color
+                    </label>
+                    <input
+                      type="text"
+                      name="color"
+                      defaultValue={editingItem?.color}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Dimensions
+                    </label>
+                    <input
+                      type="text"
+                      name="dimensions"
+                      defaultValue={editingItem?.dimensions}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="e.g., 30cm x 20cm x 10cm"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Weight (kg)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      name="weight"
+                      defaultValue={editingItem?.weight}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Year
+                    </label>
+                    <input
+                      type="number"
+                      name="year"
+                      defaultValue={editingItem?.year}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="e.g., 2024"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Capacity
+                    </label>
+                    <input
+                      type="number"
+                      step="0.001"
+                      name="capacity"
+                      defaultValue={editingItem?.capacity}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="e.g., 500"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Pricing */}
+              <div className="space-y-4">
+                <h3 className="text-lg font-medium text-gray-900">Pricing</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Purchase Cost
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      name="purchase_cost"
+                      defaultValue={editingItem?.purchase_cost}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Replacement Cost
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      name="replacement_cost"
+                      defaultValue={editingItem?.replacement_cost}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Options */}
+              <div className="space-y-4">
+                <h3 className="text-lg font-medium text-gray-900">Options</h3>
+                <div className="flex items-center gap-6">
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      name="is_kit"
+                      defaultChecked={editingItem?.is_kit}
+                      className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                    />
+                    <span className="text-sm text-gray-700">Is Kit</span>
+                  </label>
+
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      name="is_active"
+                      defaultChecked={editingItem?.is_active ?? true}
+                      className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                    />
+                    <span className="text-sm text-gray-700">Active</span>
+                  </label>
+                </div>
+              </div>
+
+              {/* Images */}
+              {editingItem && (
+                <div className="space-y-4">
+                  <h3 className="text-lg font-medium text-gray-900">Images</h3>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowAddModal(false);
+                      setShowGallery({ itemId: editingItem.id, itemName: editingItem.name });
+                    }}
+                    className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700"
+                  >
+                    <ImageIcon className="w-4 h-4" />
+                    Manage Photo Gallery
+                  </button>
+                  <p className="text-sm text-gray-500">
+                    Upload and manage images for this item
+                  </p>
+                </div>
+              )}
+
+              {/* Action Buttons */}
+              <div className="flex items-center justify-end gap-3 pt-4 border-t border-gray-200">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAddModal(false);
+                    setEditingItem(null);
+                  }}
+                  className="px-4 py-2 text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+                >
+                  {editingItem ? 'Update Item' : 'Add Item'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showSerializedManager && (
+        <SerializedItemsManager
+          itemId={showSerializedManager.itemId}
+          itemName={showSerializedManager.itemName}
+          onClose={() => {
+            setShowSerializedManager(null);
+            fetchData();
+          }}
+        />
+      )}
+
+      {showGallery && (
+        <StockItemGallery
+          itemId={showGallery.itemId}
+          itemName={showGallery.itemName}
+          onClose={() => {
+            setShowGallery(null);
+            if (editingItem && editingItem.id === showGallery.itemId) {
+              setShowAddModal(true);
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+}
